@@ -1,0 +1,39 @@
+# Virtual env
+venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Secrets / local config
+.env
+.env.*
+*.pem
+kaggle.json
+access_token
+
+# Large data (download / rebuild locally)
+data/raw/*
+!data/raw/.gitkeep
+data/interim/*
+!data/interim/.gitkeep
+data/processed/*
+!data/processed/.gitkeep
+
+# Generated figures (keep the folder)
+reports/figures/*
+!reports/figures/.gitkeep
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
