@@ -1,57 +1,120 @@
 import numpy as np
 import pandas as pd
-from sklearn.ensemble import RandomForestRegressor
 
 TARGET_PCT = 92.0
+DEFAULT_HORIZONS = (1, 3, 6)
+DRIFT_LOOKBACK = 12
 
 
-def forecast_national_backlog(national: pd.DataFrame, horizons=(1, 3, 6)) -> pd.DataFrame:
-    """Simple lag regression on national backlog."""
+def forecast_national_backlog(
+    national: pd.DataFrame,
+    horizons=DEFAULT_HORIZONS,
+    lookback: int = DRIFT_LOOKBACK,
+) -> pd.DataFrame:
+    """
+    Drift forecast on national backlog.
+
+    last_backlog + h * average monthly change over the previous `lookback` months.
+    Chosen because it beat naive and the previous lag-based random forest on a
+    12-origin walk-forward holdout (horizons 1/3/6).
+    """
     df = national.sort_values("period").copy()
-    df["t"] = np.arange(len(df))
-    df["backlog_lag1"] = df["backlog"].shift(1)
-    df["backlog_lag3"] = df["backlog"].shift(3)
-    df["backlog_roll3"] = df["backlog"].rolling(3, min_periods=1).mean()
-    train = df.dropna().copy()
+    if df.empty:
+        return pd.DataFrame(columns=["horizon_months", "period", "backlog_forecast"])
 
-    features = ["t", "backlog_lag1", "backlog_lag3", "backlog_roll3"]
-    model = RandomForestRegressor(n_estimators=200, random_state=42)
-    model.fit(train[features], train["backlog"])
+    last = df.iloc[-1]
+    last_val = float(last["backlog"])
+    window = df["backlog"].tail(lookback + 1)
+    if len(window) < 2:
+        monthly_drift = 0.0
+    else:
+        monthly_drift = float(window.iloc[-1] - window.iloc[0]) / (len(window) - 1)
 
-    # one-step rolling forecast from latest known point
-    history = df.copy()
     rows = []
-    for h in range(1, max(horizons) + 1):
-        last = history.iloc[-1]
-        lag1 = history.iloc[-1]["backlog"]
-        lag3 = history.iloc[-3]["backlog"] if len(history) >= 3 else lag1
-        roll3 = history["backlog"].tail(3).mean()
-        x = pd.DataFrame([{
-            "t": last["t"] + 1,
-            "backlog_lag1": lag1,
-            "backlog_lag3": lag3,
-            "backlog_roll3": roll3,
-        }])
-        pred = float(model.predict(x)[0])
-        next_period = last["period"] + pd.offsets.MonthBegin(1)
-        history = pd.concat([
-            history,
-            pd.DataFrame([{
-                "period": next_period,
-                "period_yyyymm": next_period.strftime("%Y-%m"),
-                "backlog": pred,
-                "t": last["t"] + 1,
-            }]),
-        ], ignore_index=True)
-        if h in horizons:
-            rows.append({"horizon_months": h, "period": next_period.strftime("%Y-%m"), "backlog_forecast": pred})
+    for h in horizons:
+        period = (last["period"] + pd.offsets.MonthBegin(int(h))).strftime("%Y-%m")
+        rows.append({
+            "horizon_months": int(h),
+            "period": period,
+            "backlog_forecast": last_val + int(h) * monthly_drift,
+        })
     return pd.DataFrame(rows)
+
+
+def _naive_forecast(history: pd.DataFrame, horizons=DEFAULT_HORIZONS) -> pd.DataFrame:
+    last = history.iloc[-1]
+    last_val = float(last["backlog"])
+    rows = []
+    for h in horizons:
+        period = (last["period"] + pd.offsets.MonthBegin(int(h))).strftime("%Y-%m")
+        rows.append({
+            "horizon_months": int(h),
+            "period": period,
+            "backlog_forecast": last_val,
+        })
+    return pd.DataFrame(rows)
+
+
+def backtest_national_backlog(
+    national: pd.DataFrame,
+    horizons=DEFAULT_HORIZONS,
+    n_origins: int = 12,
+    lookback: int = DRIFT_LOOKBACK,
+) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Walk-forward holdout comparing drift vs naive at each horizon.
+
+    Returns (detail errors, mae summary pivoted by model x horizon).
+    """
+    full = national.sort_values("period").reset_index(drop=True)
+    max_h = max(horizons)
+    last_origin_idx = len(full) - 1 - max_h
+    first_origin_idx = max(lookback + 1, last_origin_idx - n_origins + 1)
+    if last_origin_idx < first_origin_idx:
+        raise ValueError("Not enough history for the requested backtest window.")
+
+    detail_rows = []
+    for origin_idx in range(first_origin_idx, last_origin_idx + 1):
+        history = full.iloc[: origin_idx + 1].copy()
+        origin_period = history.iloc[-1]["period"].strftime("%Y-%m")
+        preds = {
+            "drift": forecast_national_backlog(history, horizons=horizons, lookback=lookback),
+            "naive": _naive_forecast(history, horizons=horizons),
+        }
+        for model_name, fc in preds.items():
+            for _, row in fc.iterrows():
+                h = int(row["horizon_months"])
+                actual = float(full.iloc[origin_idx + h]["backlog"])
+                pred = float(row["backlog_forecast"])
+                detail_rows.append({
+                    "origin_period": origin_period,
+                    "model": model_name,
+                    "horizon_months": h,
+                    "period": row["period"],
+                    "backlog_actual": actual,
+                    "backlog_forecast": pred,
+                    "abs_error": abs(pred - actual),
+                })
+
+    detail = pd.DataFrame(detail_rows)
+    mae = (
+        detail.groupby(["model", "horizon_months"], as_index=False)["abs_error"]
+        .mean()
+        .rename(columns={"abs_error": "mae"})
+    )
+    mae_table = mae.pivot(index="model", columns="horizon_months", values="mae")
+    mae_table = mae_table.reindex(["drift", "naive"])
+    mae_table.columns = [f"h{h}_mae" for h in mae_table.columns]
+    return detail, mae_table
 
 
 def breach_risk_table(ts: pd.DataFrame, min_backlog: float = 2000) -> pd.DataFrame:
     """
-    Latest-month Trust x specialty risk score.
-    High risk = low pct_within_18 + large backlog + worsening trend.
+    Latest-month Trust x specialty current-severity ranking.
+
+    Score = gap below 92% + backlog size + recent % drop. Use for triage of
+    pockets that are already weak/large — not as a forecast of next-month
+    deterioration (walk-forward checks did not beat chance on % within 18).
     """
     df = ts.sort_values(["provider_org_code", "treatment_function_code", "period"]).copy()
     df["pct_lag1"] = df.groupby(

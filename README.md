@@ -138,8 +138,8 @@ Those are from a completed run of this pipeline, not live NHS feeds.
 
 ## Honest limits
 
-- The forecast is a **simple lag-based random forest** on the national series. It’s a sketch, not a capacity model.
-- “Breach risk” is a **heuristic score** (distance from 92%, backlog size, recent deterioration) — useful for triage, not a clinical priority score.
+- The forecast is a **12-month drift** model on the national series (`last + h ×` average monthly change). It beat naive and a lag-based random forest on a walk-forward holdout; still a sketch, not a capacity model.
+- “Breach risk” is a **current-severity heuristic** (gap to 92%, backlog size, recent deterioration). Useful for triage; a walk-forward check showed it does **not** predict next-month % within-18 deterioration better than chance.
 - Specialty “Total” rows are dropped in ingest so we don’t double-count. If your question needs a different slice of RTT (e.g. completed pathways), you’ll need to change the filter.
 
 ## If something looks empty
